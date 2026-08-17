@@ -1,42 +1,83 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import peggy from 'peggy';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 /**
- * Sub-Store Workers - Vite 配置
- *
- * 重要说明：
- * Cloudflare Vite 插件会自动处理 Worker 入口和静态资源。
- * 但 Sub-Store 源码需要特殊的代码替换处理。
+ * 预编译 Peggy Parser 以适配 Workers 运行环境（避免动态 eval / Function）
  */
-import { defineConfig } from 'vite';
-import { cloudflare } from '@cloudflare/vite-plugin';
-import { createDashboardBuildParts } from './vite.shared.config.js';
+function precompilePeggyParser(code, id) {
+  // 匹配常见的 grammar 变量定义或直接调用 peggy.generate 的模板内容
+  const grammarMatch =
+    code.match(/(?:const|let|var)\s+(?:grammar|grammars|peggyGrammar|pegGrammar)\s*=\s*[`'"]([\s\S]*?)[`'"];?/) ||
+    code.match(/peggy\.generate\(\s*[`'"]([\s\S]*?)[`'"]/);
 
-const dashboard = createDashboardBuildParts();
+  if (!grammarMatch || !grammarMatch[1]) {
+    // 若上游已直接提供预编译产物或变量名变更，则告警跳过，不阻断构建
+    console.warn(`[sub-store-transform] ${id}: 跳过 Peggy 语法预编译（未找到 grammars 变量，保留原文件）`);
+    return code;
+  }
 
-export default defineConfig({
+  const grammar = grammarMatch[1];
+
+  try {
+    const parserSource = peggy.generate(grammar, {
+      output: 'source',
+      format: 'es',
+    });
+
+    return `
+      ${parserSource}
+      export default { parse };
+    `;
+  } catch (err) {
+    console.error(`[sub-store-transform] ${id} Peggy 预编译异常: ${err.message}`);
+    return code;
+  }
+}
+
+/**
+ * Sub-Store Workers 共享转换插件
+ */
+function subStoreTransformPlugin() {
+  return {
+    name: 'sub-store-transform',
+    enforce: 'pre',
+    transform(code, id) {
+      // 处理 peggy parser 目录下的语法文件
+      if (id.includes('parsers/peggy/') && id.endsWith('.js')) {
+        return {
+          code: precompilePeggyParser(code, id),
+          map: null,
+        };
+      }
+      return null;
+    },
+  };
+}
+
+/**
+ * 导出公共构建配置组件
+ */
+export function createDashboardBuildParts() {
+  return {
     plugins: [
-        ...dashboard.plugins,
-        cloudflare(),
+      subStoreTransformPlugin(),
     ],
-    resolve: dashboard.resolve,
-    environments: {
-        client: {
-            build: {
-                assetsDir: dashboard.assetsDir,
-                rollupOptions: {
-                    input: dashboard.input,
-                    external: dashboard.external,
-                },
-            },
-        },
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, 'src'),
+      },
     },
-    optimizeDeps: dashboard.optimizeDeps,
-    // 开发服务器配置
-    server: {
-        strictPort: true,
-        cors: {
-            origin: '*',
-            methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-            allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization'],
-            credentials: true,
-        },
+    assetsDir: 'assets',
+    input: {
+      index: path.resolve(__dirname, 'src/index.html'),
     },
-});
+    external: [],
+    optimizeDeps: {
+      include: ['peggy'],
+    },
+  };
+}
